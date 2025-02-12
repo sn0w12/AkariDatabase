@@ -3,7 +3,7 @@ import asyncio
 from typing import Dict, List, Any
 import json
 import csv
-from datetime import datetime
+from datetime import datetime, timezone  # Add timezone to imports
 import os
 from uuid import uuid4
 import argparse
@@ -14,6 +14,10 @@ import platform
 from aiohttp import ClientTimeout
 from tenacity import retry, stop_after_attempt, wait_exponential
 from scrape import scrape_manga_chapter
+import asyncpg
+from asyncpg.exceptions import UniqueViolationError
+import os
+from dotenv import load_dotenv
 
 MAX_CONCURRENT_REQUESTS = 5
 CHAPTER_BATCH_SIZE = 50
@@ -30,11 +34,180 @@ COOKIE_DATA = {
 HEADERS = {"Cookie": f"user_acc={json.dumps(COOKIE_DATA)}"}
 URL = "http://localhost:3000"
 
-TIMEOUT = ClientTimeout(total=30)
+TIMEOUT = ClientTimeout(total=60)  # Increase from 30 to 60 seconds
 
 if platform.system() == "Windows":
     # Use ProactorEventLoop on Windows
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+load_dotenv()
+
+# Database connection parameters
+DB_CONFIG = {
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "manga_db"),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": os.getenv("DB_PORT", "5432"),
+}
+
+
+async def get_db_pool():
+    """Create and return database connection pool with timezone handling"""
+    return await asyncpg.create_pool(
+        **DB_CONFIG,
+        server_settings={"timezone": "UTC"},  # Ensure server uses UTC
+    )
+
+
+def normalize_datetime(dt):
+    """Normalize datetime to UTC without timezone info"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None)  # Strip timezone info for PostgreSQL
+
+
+def parse_datetime(date_str):
+    """Convert any datetime string or object to UTC datetime without timezone info"""
+    if isinstance(date_str, datetime):
+        return normalize_datetime(
+            date_str if date_str.tzinfo else date_str.replace(tzinfo=timezone.utc)
+        )
+    elif isinstance(date_str, str):
+        try:
+            # Try parsing ISO format
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            return normalize_datetime(
+                dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            )
+        except ValueError:
+            try:
+                # Fallback: try parsing as simple datetime string
+                dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                return normalize_datetime(dt.replace(tzinfo=timezone.utc))
+            except ValueError:
+                try:
+                    # Another fallback for simpler format
+                    dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+                    return normalize_datetime(dt.replace(tzinfo=timezone.utc))
+                except ValueError:
+                    return normalize_datetime(datetime.now(timezone.utc))
+    return normalize_datetime(datetime.now(timezone.utc))
+
+
+async def upsert_manga(pool, manga_data: Dict[str, Any]) -> None:
+    """Insert or update manga record"""
+    query = """
+        INSERT INTO Manga (
+            id, manga_id, story_data, image_url, titles, authors, genres,
+            status, views, score, description, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (id) DO UPDATE SET
+            manga_id = EXCLUDED.manga_id,
+            story_data = EXCLUDED.story_data,
+            image_url = EXCLUDED.image_url,
+            titles = EXCLUDED.titles,
+            authors = EXCLUDED.authors,
+            genres = EXCLUDED.genres,
+            status = EXCLUDED.status,
+            views = EXCLUDED.views,
+            score = EXCLUDED.score,
+            description = EXCLUDED.description,
+            updated_at = EXCLUDED.updated_at;
+    """
+
+    try:
+        # Ensure timestamps are properly normalized
+        default_time = datetime.now(timezone.utc)
+        created_at = parse_datetime(manga_data.get("createdAt", default_time))
+        updated_at = parse_datetime(manga_data.get("updatedAt", default_time))
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                query,
+                manga_data["id"],
+                int(manga_data.get("mangaId", 0)),
+                manga_data.get("storyData", ""),
+                manga_data.get("imageUrl", ""),
+                json.dumps(manga_data.get("titles", {})),
+                manga_data.get("authors", []),
+                manga_data.get("genres", []),
+                manga_data.get("status", ""),
+                manga_data.get("views", "0"),
+                float(manga_data.get("score", 0)),
+                manga_data.get("description", ""),
+                created_at,  # Now normalized without timezone info
+                updated_at,  # Now normalized without timezone info
+            )
+    except Exception as e:
+        print(f"Error upserting manga {manga_data['id']}: {str(e)}")
+        print(
+            f"Debug info - createdAt: {manga_data.get('createdAt')}, updatedAt: {manga_data.get('updatedAt')}"
+        )
+        print(f"Parsed dates - created_at: {created_at}, updated_at: {updated_at}")
+        raise
+
+
+async def upsert_chapters(
+    pool, chapters: List[Dict[str, Any]], manga_chapters_metadata: Dict[str, Any]
+) -> None:
+    """Insert or update chapter records"""
+    query = """
+        INSERT INTO Chapter (
+            pk_id, id, parent_id, story_data, chapter_data, title,
+            images, next_chapter, previous_chapter, views, pages,
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (pk_id) DO UPDATE SET
+            story_data = EXCLUDED.story_data,
+            chapter_data = EXCLUDED.chapter_data,
+            title = EXCLUDED.title,
+            images = EXCLUDED.images,
+            next_chapter = EXCLUDED.next_chapter,
+            previous_chapter = EXCLUDED.previous_chapter,
+            views = EXCLUDED.views,
+            pages = EXCLUDED.pages,
+            updated_at = EXCLUDED.updated_at;
+    """
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for chapter in chapters:
+                try:
+                    images = chapter.get("images", [])
+                    if isinstance(images, str):
+                        images = json.loads(images)
+
+                    chapter_id = chapter.get("id", "")
+                    chapter_metadata = manga_chapters_metadata.get(chapter_id, {})
+                    timestamp = datetime.now(
+                        timezone.utc
+                    )  # Make default timestamp timezone-aware
+                    created_at = parse_datetime(
+                        chapter_metadata.get("createdAt", timestamp)
+                    )
+                    updated_at = parse_datetime(
+                        chapter_metadata.get("updatedAt", timestamp)
+                    )
+
+                    await conn.execute(
+                        query,
+                        str(uuid4()),
+                        chapter.get("id", ""),
+                        chapter.get("parentId", ""),
+                        chapter.get("storyData", ""),
+                        chapter.get("chapterData", ""),
+                        chapter.get("title", ""),
+                        json.dumps(optimize_image_urls(images)),
+                        chapter.get("nextChapter", ""),
+                        chapter.get("previousChapter", ""),
+                        chapter_metadata.get("views", "0"),
+                        chapter.get("pages", 0),
+                        created_at,  # Use the parsed datetime
+                        updated_at,  # Use the parsed datetime
+                    )
+                except Exception as e:
+                    print(f"Error upserting chapter {chapter.get('id', '')}: {str(e)}")
 
 
 def transform_chapters(chapters):
@@ -76,47 +249,66 @@ async def fetch_chapter(
         return chapter
 
 
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_DELAY, min=1, max=10),
+)
 async def fetch_manga_and_chapters(
     manga_id: str, semaphore: asyncio.Semaphore
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    async with aiohttp.ClientSession() as session:
-        # Fetch manga details with explicit headers
-        async with semaphore:
-            request_headers = HEADERS.copy()
-            async with session.get(
-                f"{URL}/api/python/{manga_id}",
-                headers=request_headers,
-            ) as response:
-                if response.status != 200:
-                    raise Exception(
-                        f"Failed to fetch manga {manga_id}: {response.status}"
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            # Fetch manga details with explicit headers
+            async with semaphore:
+                request_headers = HEADERS.copy()
+                try:
+                    async with session.get(
+                        f"{URL}/api/python/{manga_id}",
+                        headers=request_headers,
+                    ) as response:
+                        if response.status != 200:
+                            raise Exception(
+                                f"Failed to fetch manga {manga_id}: {response.status}"
+                            )
+                        manga_data = await response.json()
+                        await asyncio.sleep(REQUEST_DELAY)
+                except asyncio.TimeoutError:
+                    print(f"Timeout while fetching manga {manga_id}, retrying...")
+                    raise  # This will trigger the retry decorator
+
+            # Extract chapter IDs
+            chapter_ids = [chapter["id"] for chapter in manga_data["chapters"]]
+
+            # Process chapters in batches with timeout handling
+            valid_chapters = []
+            for i in range(0, len(chapter_ids), CHAPTER_BATCH_SIZE):
+                batch = chapter_ids[i : i + CHAPTER_BATCH_SIZE]
+                tasks = []
+                for chapter_id in batch:
+                    task = scrape_manga_chapter(
+                        manga_id, chapter_id, json.dumps(COOKIE_DATA)
                     )
-                manga_data = await response.json()
-                await asyncio.sleep(REQUEST_DELAY)
+                    tasks.append(task)
 
-        # Extract chapter IDs
-        chapter_ids = [chapter["id"] for chapter in manga_data["chapters"]]
+                try:
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    valid_chapters.extend(
+                        [
+                            chapter
+                            for chapter in batch_results
+                            if not isinstance(chapter, Exception)
+                        ]
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"Timeout while fetching batch of chapters for manga {manga_id}, retrying..."
+                    )
+                    raise  # This will trigger the retry decorator
 
-        # Process chapters in batches
-        valid_chapters = []
-        for i in range(0, len(chapter_ids), CHAPTER_BATCH_SIZE):
-            batch = chapter_ids[i : i + CHAPTER_BATCH_SIZE]
-            tasks = [
-                scrape_manga_chapter(manga_id, chapter_id, json.dumps(COOKIE_DATA))
-                for chapter_id in batch
-            ]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Filter out any failed chapter fetches and error dictionaries
-            valid_chapters.extend(
-                [
-                    chapter
-                    for chapter in batch_results
-                    if not isinstance(chapter, Exception)
-                ]
-            )
-
-        return manga_data, valid_chapters
+            return manga_data, valid_chapters
+    except Exception as e:
+        print(f"Error in fetch_manga_and_chapters for {manga_id}: {str(e)}")
+        raise
 
 
 async def fetch_latest_manga_list(
@@ -233,172 +425,27 @@ def optimize_image_urls(images: List[str]) -> Dict[str, Any]:
     }
 
 
-def export_to_csv(
-    manga_data: Dict[str, Any], chapters: List[Dict[str, Any]], first_write: bool
-) -> None:
-    timestamp = datetime.utcnow().isoformat()
-    os.makedirs("exports", exist_ok=True)
-
-    manga_row = {
-        "id": manga_data["id"],
-        "manga_id": manga_data.get("mangaId", ""),
-        "story_data": manga_data.get("storyData", ""),
-        "image_url": manga_data.get("imageUrl", ""),
-        "titles": json.dumps(manga_data.get("titles", {})),
-        "authors": json.dumps(manga_data.get("authors", [])),
-        "genres": json.dumps(manga_data.get("genres", [])),
-        "status": manga_data.get("status", ""),
-        "views": manga_data.get("views", "0"),
-        "score": float(manga_data.get("score", 0)),
-        "description": manga_data.get("description", "").replace("\n", "\\n"),
-        "created_at": manga_data.get("createdAt", timestamp),
-        "updated_at": manga_data.get("updatedAt", timestamp),
-    }
-
-    manga_fields = [
-        "id",
-        "manga_id",
-        "story_data",
-        "image_url",
-        "titles",
-        "authors",
-        "genres",
-        "status",
-        "views",
-        "score",
-        "description",
-        "created_at",
-        "updated_at",
-    ]
-
-    # Change the file mode logic
-    if os.path.exists("exports/manga.csv"):
-        mode = "a"  # Always append if file exists
-        write_header = False
-    else:
-        mode = "w"  # Only write mode for new file
-        write_header = True
-
-    # Read existing manga IDs
-    existing_manga_ids = set()
-    if os.path.exists("exports/manga.csv"):
-        with open("exports/manga.csv", "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            existing_manga_ids = {row["id"] for row in reader}
-
-    # Only write if manga doesn't exist
-    if manga_row["id"] not in existing_manga_ids:
-        with open("exports/manga.csv", mode, newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=manga_fields)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(manga_row)
-    else:
-        print(f"Skipping existing manga {manga_row['id']}")
-
-    chapter_fields = [
-        "pk_id",
-        "id",
-        "story_data",
-        "chapter_data",
-        "title",
-        "images",
-        "next_chapter",
-        "previous_chapter",
-        "parent_id",
-        "views",
-        "pages",
-        "created_at",
-        "updated_at",
-    ]
-
-    # Fix: Properly handle chapter data
-    new_chapters_data = []
-    manga_chapters_metadata = {
-        chapter["id"]: {
-            "views": chapter["views"],
-            "createdAt": chapter["createdAt"],
-            "updatedAt": chapter["updatedAt"],
-        }
-        for chapter in manga_data.get("chapters", [])
-    }
-
-    for chapter in chapters:
-        try:
-            images = chapter.get("images", [])
-            if isinstance(images, str):
-                images = json.loads(images)
-
-            chapter_id = chapter.get("id", "")
-            chapter_metadata = manga_chapters_metadata.get(chapter_id, {})
-
-            chapter_row = {
-                "pk_id": str(uuid4()),
-                "id": chapter.get("id", ""),
-                "title": chapter.get("title", ""),
-                "story_data": chapter.get("storyData", ""),
-                "chapter_data": chapter.get("chapterData", ""),
-                "images": json.dumps(optimize_image_urls(images)),
-                "next_chapter": chapter.get("nextChapter", ""),
-                "previous_chapter": chapter.get("previousChapter", ""),
-                "parent_id": chapter.get("parentId", ""),
-                "views": chapter_metadata.get("views", 0),
-                "pages": chapter.get("pages", 0),
-                "created_at": chapter_metadata.get("createdAt", timestamp),
-                "updated_at": chapter_metadata.get("updatedAt", timestamp),
-            }
-            new_chapters_data.append(chapter_row)
-        except Exception as e:
-            print(f"Error processing chapter: {str(e)}")
-            continue
-
-    # Fix: Use proper error handling for DataFrame operations
-    try:
-        # Load existing chapters if file exists
-        existing_chapters_df = pd.DataFrame(columns=chapter_fields)
-        if os.path.exists("exports/chapters.csv") and not first_write:
-            existing_chapters_df = pd.read_csv(
-                "exports/chapters.csv",
-                dtype={
-                    "pk_id": str,
-                    "id": str,
-                    "parent_id": str,
-                    "next_chapter": str,
-                    "previous_chapter": str,
-                },
-            )
-
-        # Convert new chapters to DataFrame
-        new_chapters_df = pd.DataFrame(new_chapters_data)
-
-        # Combine and deduplicate
-        if first_write:
-            final_chapters_df = new_chapters_df
-        else:
-            final_chapters_df = pd.concat(
-                [existing_chapters_df, new_chapters_df], ignore_index=True
-            )
-            final_chapters_df = final_chapters_df.drop_duplicates(
-                subset=["id", "parent_id"], keep="last"
-            )
-
-        # Save with proper encoding
-        final_chapters_df.to_csv("exports/chapters.csv", index=False, encoding="utf-8")
-
-    except Exception as e:
-        print(f"Error saving chapters CSV: {str(e)}")
-        raise
-
-
 async def process_single_manga(
-    manga: Dict[str, Any], first_write: bool, semaphore: asyncio.Semaphore
+    manga: Dict[str, Any], pool: asyncpg.Pool, semaphore: asyncio.Semaphore
 ) -> None:
     try:
         manga_data, chapters = await fetch_manga_and_chapters(manga["id"], semaphore)
         print(
             f"Fetched manga: {manga_data['titles']['default']} with {len(chapters)} chapters"
         )
-        export_to_csv(manga_data, chapters, first_write)
+
+        # Get chapters metadata
+        manga_chapters_metadata = {
+            chapter["id"]: {
+                "views": chapter["views"],
+                "createdAt": chapter["createdAt"],
+                "updatedAt": chapter["updatedAt"],
+            }
+            for chapter in manga_data.get("chapters", [])
+        }
+
+        await upsert_manga(pool, manga_data)
+        await upsert_chapters(pool, chapters, manga_chapters_metadata)
         return True
     except Exception as e:
         print(f"Error processing manga {manga['id']}: {str(e)}")
@@ -414,8 +461,9 @@ async def main():
 
     start_time = time.time()
     try:
+        pool = await get_db_pool()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        # Fixed session creation and ensure it's properly closed
+
         async with aiohttp.ClientSession() as session:
             page = 1
             total_pages = None
@@ -440,9 +488,7 @@ async def main():
             tasks = []
             manga_items = first_page.get("mangaList", [])
             for manga in manga_items:
-                tasks.append(
-                    process_single_manga(manga, False, semaphore)
-                )  # Always pass False for first_write
+                tasks.append(process_single_manga(manga, pool, semaphore))
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # Process remaining pages
@@ -459,37 +505,34 @@ async def main():
                 tasks = []
                 manga_items = manga_list.get("mangaList", [])
                 for manga in manga_items:
-                    tasks.append(process_single_manga(manga, False, semaphore))
+                    tasks.append(process_single_manga(manga, pool, semaphore))
 
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Get statistics and print summary BEFORE closing the pool
+        async with pool.acquire() as conn:
+            manga_count = await conn.fetchval("SELECT COUNT(*) FROM Manga")
+            chapter_count = await conn.fetchval("SELECT COUNT(*) FROM Chapter")
+
+        # Close the connection pool
+        await pool.close()
+
+        # Calculate and print timing statistics
         elapsed_time = time.time() - start_time
         pages_processed = min(page, full_total_pages)
         time_per_page = elapsed_time / pages_processed
         estimated_total_time = time_per_page * full_total_pages
 
-        # Get file sizes and estimates
-        manga_size = os.path.getsize("exports/manga.csv") / (1024 * 1024)  # Size in MB
-        chapters_size = os.path.getsize("exports/chapters.csv") / (
-            1024 * 1024
-        )  # Size in MB
-        total_size = manga_size + chapters_size
-
-        # Calculate size per page and estimated total size
-        size_per_page = total_size / pages_processed
-        estimated_total_size = size_per_page * full_total_pages
-
-        print(f"\nExported data to exports/manga.csv and exports/chapters.csv")
-        print(f"Manga.csv size: {manga_size:.2f} MB")
-        print(f"Chapters.csv size: {chapters_size:.2f} MB")
-        print(f"Current total size: {total_size:.2f} MB")
-        print(
-            f"Estimated final size: {estimated_total_size:.2f} MB ({estimated_total_size/1024:.2f} GB)"
-        )
+        # Print all statistics
+        print(f"\nDatabase Statistics:")
+        print(f"Total manga records: {manga_count}")
+        print(f"Total chapter records: {chapter_count}")
+        print(f"\nTiming Statistics:")
         print(f"Time elapsed: {elapsed_time:.2f} seconds")
         print(f"Average time per page: {time_per_page:.2f} seconds")
         print(
-            f"Estimated total time for all {full_total_pages} pages: {estimated_total_time:.2f} seconds ({estimated_total_time/60:.2f} minutes) ({estimated_total_time/3600:.2f} hours)"
+            f"Estimated total time for all {full_total_pages} pages: {estimated_total_time:.2f} seconds "
+            f"({estimated_total_time/60:.2f} minutes) ({estimated_total_time/3600:.2f} hours)"
         )
 
     except Exception as e:
