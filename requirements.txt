@@ -1,0 +1,5 @@
+aiohttp
+pandas
+supabase
+uuid
+python-dotenv

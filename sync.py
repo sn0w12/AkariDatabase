@@ -9,16 +9,32 @@ from uuid import uuid4
 import argparse
 import time  # Add this import
 import os.path  # Add this to existing imports if not present
-from config import supabase  # Add to imports at top
+import pandas as pd  # Add this import
+import platform
+from aiohttp import ClientTimeout
+from tenacity import retry, stop_after_attempt, wait_exponential
+from scrape import scrape_manga_chapter
 
-# Add these constants at the top after imports
-MAX_CONCURRENT_REQUESTS = 6
-CHAPTER_BATCH_SIZE = 15
-REQUEST_DELAY = 0
+MAX_CONCURRENT_REQUESTS = 5
+CHAPTER_BATCH_SIZE = 20
+REQUEST_DELAY = 0.5
+MAX_RETRIES = 5
+RETRY_DELAY = 2
 
-# Add this constant after the other constants
-COOKIE_VALUE = '{"user_version":"2.2","user_name":"Sn0w","user_image":"https:\/\/user.manganelo.com\/avt.png","user_data":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.lNXdfJGbnJyeiojIlBXe09lcnJCLiwWYj9Gbp9lclNXdfJGb2MzNxEjI6ICZfJGbnJCLigDNyV2c19lclNXdyEzdw42ciojI19lYsdmIsIyMc2VyX2FwaSI6IiJ9.KnKwLVkLwBR30v9OaHAHtXmaIcSqcrwekA5g-gnpW3Y"}'
-HEADERS = {"Cookie": f"user_acc={COOKIE_VALUE}"}
+COOKIE_DATA = {
+    "user_version": "2.2",
+    "user_name": "Sn0w",
+    "user_image": "https://user.manganelo.com/avt.png",
+    "user_data": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.lNXdfJGbnJyeiojIlBXe09lcnJCLiwWYj9Gbp9lclNXdfJGb2MzNxEjI6ICZfJGbnJCLigDNyV2c19lclNXdyEzdw42ciojI19lYsdmIsIyMc2VyX2FwaSI6IiJ9.KnKwLVkLwBR30v9OaHAHtXmaIcSqcrwekA5g-gnpW3Y",
+}
+HEADERS = {"Cookie": f"user_acc={json.dumps(COOKIE_DATA)}"}
+URL = "http://localhost:3000"
+
+TIMEOUT = ClientTimeout(total=30)
+
+if platform.system() == "Windows":
+    # Use ProactorEventLoop on Windows
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def transform_chapters(chapters):
@@ -26,6 +42,25 @@ def transform_chapters(chapters):
         chapter["images"] = json.loads(chapter["images"])
 
 
+async def validate_response(response, chapter_id=None):
+    """Validate response content and headers"""
+    try:
+        data = await response.json()
+        if not data or (chapter_id and not data.get("images")):
+            print(f"Invalid response content for {chapter_id or 'request'}")
+            print(f"Response headers: {response.headers}")
+            print(f"Request headers: {response.request_info.headers}")
+            return False
+        return True
+    except Exception as e:
+        print(f"Error validating response: {str(e)}")
+        return False
+
+
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_DELAY, min=1, max=10),
+)
 async def fetch_chapter(
     session: aiohttp.ClientSession,
     manga_id: str,
@@ -33,29 +68,24 @@ async def fetch_chapter(
     semaphore: asyncio.Semaphore,
 ) -> Dict[str, Any]:
     async with semaphore:
-        # Explicitly include headers in the request
-        async with session.get(
-            f"https://akari-psi.vercel.app/api/python/{manga_id}/{chapter_id}",
-            headers=HEADERS,  # Add headers here
-        ) as response:
-            if response.status != 200:
-                raise Exception(
-                    f"Failed to fetch chapter {chapter_id}: {response.status}"
-                )
-            await asyncio.sleep(REQUEST_DELAY)  # Add delay between requests
-            return await response.json()
+        chapter = await scrape_manga_chapter(
+            manga_id, chapter_id, json.dumps(COOKIE_DATA)
+        )
+        print(chapter)
+        await asyncio.sleep(REQUEST_DELAY)
+        return chapter
 
 
 async def fetch_manga_and_chapters(
     manga_id: str, semaphore: asyncio.Semaphore
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    # Use the HEADERS constant instead of recreating it
     async with aiohttp.ClientSession() as session:
-        # Fetch manga details
+        # Fetch manga details with explicit headers
         async with semaphore:
+            request_headers = HEADERS.copy()
             async with session.get(
-                f"https://akari-psi.vercel.app/api/python/{manga_id}",
-                headers=HEADERS,  # Add headers here
+                f"{URL}/api/python/{manga_id}",
+                headers=request_headers,
             ) as response:
                 if response.status != 200:
                     raise Exception(
@@ -72,12 +102,12 @@ async def fetch_manga_and_chapters(
         for i in range(0, len(chapter_ids), CHAPTER_BATCH_SIZE):
             batch = chapter_ids[i : i + CHAPTER_BATCH_SIZE]
             tasks = [
-                fetch_chapter(session, manga_id, chapter_id, semaphore)
+                scrape_manga_chapter(manga_id, chapter_id, json.dumps(COOKIE_DATA))
                 for chapter_id in batch
             ]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Filter out any failed chapter fetches
+            # Filter out any failed chapter fetches and error dictionaries
             valid_chapters.extend(
                 [
                     chapter
@@ -93,7 +123,8 @@ async def fetch_latest_manga_list(
     session: aiohttp.ClientSession, page: int
 ) -> List[Dict[str, Any]]:
     async with session.get(
-        f"https://akari-psi.vercel.app/api/manga-list/latest?page={page}"
+        f"{URL}/api/manga-list/latest?page={page}",
+        headers=HEADERS,  # Add headers here
     ) as response:
         if response.status != 200:
             raise Exception(
@@ -208,33 +239,26 @@ def export_to_csv(
     timestamp = datetime.utcnow().isoformat()
     os.makedirs("exports", exist_ok=True)
 
-    description_encoded = manga_data["description"].replace("\n", "\\n")
-
-    # Prepare manga data for both CSV and Supabase
     manga_row = {
         "id": manga_data["id"],
-        "manga_id": manga_data["mangaId"],
-        "image_url": manga_data["imageUrl"],
-        "titles": json.dumps(manga_data["titles"]),
-        "authors": json.dumps(manga_data["authors"]),
-        "genres": json.dumps(manga_data["genres"]),  # Changed to use json.dumps
-        "status": manga_data["status"],
-        "views": manga_data["views"],
-        "score": manga_data["score"],
-        "description": description_encoded,
-        "created_at": timestamp,
-        "updated_at": timestamp,
+        "manga_id": manga_data.get("mangaId", ""),
+        "story_data": manga_data.get("storyData", ""),
+        "image_url": manga_data.get("imageUrl", ""),
+        "titles": json.dumps(manga_data.get("titles", {})),
+        "authors": json.dumps(manga_data.get("authors", [])),
+        "genres": json.dumps(manga_data.get("genres", [])),
+        "status": manga_data.get("status", ""),
+        "views": manga_data.get("views", "0"),
+        "score": float(manga_data.get("score", 0)),
+        "description": manga_data.get("description", "").replace("\n", "\\n"),
+        "created_at": manga_data.get("createdAt", timestamp),
+        "updated_at": manga_data.get("updatedAt", timestamp),
     }
-
-    # Update Supabase manga table
-    try:
-        supabase.table("manga").upsert(manga_row).execute()
-    except Exception as e:
-        print(f"Error updating manga in Supabase: {str(e)}")
 
     manga_fields = [
         "id",
         "manga_id",
+        "story_data",
         "image_url",
         "titles",
         "authors",
@@ -247,17 +271,36 @@ def export_to_csv(
         "updated_at",
     ]
 
-    # Write/Append manga data
-    mode = "w" if first_write else "a"
-    with open("exports/manga.csv", mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=manga_fields)
-        if first_write:
-            writer.writeheader()
-        writer.writerow(manga_row)
+    # Change the file mode logic
+    if os.path.exists("exports/manga.csv"):
+        mode = "a"  # Always append if file exists
+        write_header = False
+    else:
+        mode = "w"  # Only write mode for new file
+        write_header = True
+
+    # Read existing manga IDs
+    existing_manga_ids = set()
+    if os.path.exists("exports/manga.csv"):
+        with open("exports/manga.csv", "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_manga_ids = {row["id"] for row in reader}
+
+    # Only write if manga doesn't exist
+    if manga_row["id"] not in existing_manga_ids:
+        with open("exports/manga.csv", mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=manga_fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(manga_row)
+    else:
+        print(f"Skipping existing manga {manga_row['id']}")
 
     chapter_fields = [
         "pk_id",
         "id",
+        "story_data",
+        "chapter_data",
         "title",
         "images",
         "next_chapter",
@@ -268,33 +311,80 @@ def export_to_csv(
         "pages",
     ]
 
-    # Write/Append chapter data
-    mode = "w" if first_write else "a"
-    with open("exports/chapters.csv", mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=chapter_fields)
-        if first_write:
-            writer.writeheader()
-        for chapter in chapters:
+    # Fix: Properly handle chapter data
+    new_chapters_data = []
+    manga_chapters_metadata = {
+        chapter["id"]: {
+            "createdAt": chapter["createdAt"],
+            "updatedAt": chapter["updatedAt"],
+        }
+        for chapter in manga_data.get("chapters", [])
+    }
+
+    for chapter in chapters:
+        try:
+            images = chapter.get("images", [])
+            if isinstance(images, str):
+                images = json.loads(images)
+
+            chapter_id = chapter.get("id", "")
+            chapter_metadata = manga_chapters_metadata.get(chapter_id, {})
+
             chapter_row = {
                 "pk_id": str(uuid4()),
-                "id": chapter["id"],
-                "title": chapter["title"],
-                "images": json.dumps(optimize_image_urls(chapter["images"])),
-                "next_chapter": chapter["nextChapter"],
-                "previous_chapter": chapter["previousChapter"],
-                "parent_id": chapter["parentId"],
-                "created_at": timestamp,
-                "updated_at": timestamp,
-                "pages": chapter["pages"],
+                "id": chapter.get("id", ""),
+                "title": chapter.get("title", ""),
+                "story_data": chapter.get("storyData", ""),
+                "chapter_data": chapter.get("chapterData", ""),
+                "images": json.dumps(optimize_image_urls(images)),
+                "next_chapter": chapter.get("nextChapter", ""),
+                "previous_chapter": chapter.get("previousChapter", ""),
+                "parent_id": chapter.get("parentId", ""),
+                "created_at": chapter_metadata.get("createdAt", timestamp),
+                "updated_at": chapter_metadata.get("updatedAt", timestamp),
+                "pages": chapter.get("pages", 0),
             }
+            new_chapters_data.append(chapter_row)
+        except Exception as e:
+            print(f"Error processing chapter: {str(e)}")
+            continue
 
-            # Update Supabase chapters table
-            try:
-                supabase.table("chapters").upsert(chapter_row).execute()
-            except Exception as e:
-                print(f"Error updating chapter in Supabase: {str(e)}")
+    # Fix: Use proper error handling for DataFrame operations
+    try:
+        # Load existing chapters if file exists
+        existing_chapters_df = pd.DataFrame(columns=chapter_fields)
+        if os.path.exists("exports/chapters.csv") and not first_write:
+            existing_chapters_df = pd.read_csv(
+                "exports/chapters.csv",
+                dtype={
+                    "pk_id": str,
+                    "id": str,
+                    "parent_id": str,
+                    "next_chapter": str,
+                    "previous_chapter": str,
+                },
+            )
 
-            writer.writerow(chapter_row)
+        # Convert new chapters to DataFrame
+        new_chapters_df = pd.DataFrame(new_chapters_data)
+
+        # Combine and deduplicate
+        if first_write:
+            final_chapters_df = new_chapters_df
+        else:
+            final_chapters_df = pd.concat(
+                [existing_chapters_df, new_chapters_df], ignore_index=True
+            )
+            final_chapters_df = final_chapters_df.drop_duplicates(
+                subset=["id", "parent_id"], keep="last"
+            )
+
+        # Save with proper encoding
+        final_chapters_df.to_csv("exports/chapters.csv", index=False, encoding="utf-8")
+
+    except Exception as e:
+        print(f"Error saving chapters CSV: {str(e)}")
+        raise
 
 
 async def process_single_manga(
@@ -319,12 +409,12 @@ async def main():
     )
     args = parser.parse_args()
 
-    start_time = time.time()  # Start timing
+    start_time = time.time()
     try:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        # Fixed session creation and ensure it's properly closed
         async with aiohttp.ClientSession() as session:
             page = 1
-            first_manga = True
             total_pages = None
 
             print(f"Fetching page {page}...")
@@ -346,12 +436,11 @@ async def main():
             # Process first page
             tasks = []
             manga_items = first_page.get("mangaList", [])
-            for i, manga in enumerate(manga_items):
+            for manga in manga_items:
                 tasks.append(
-                    process_single_manga(manga, first_manga and i == 0, semaphore)
-                )
+                    process_single_manga(manga, False, semaphore)
+                )  # Always pass False for first_write
             await asyncio.gather(*tasks, return_exceptions=True)
-            first_manga = False
 
             # Process remaining pages
             for page in range(2, total_pages + 1):
