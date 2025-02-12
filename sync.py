@@ -251,14 +251,14 @@ async def fetch_chapter(
 
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_exponential(multiplier=RETRY_DELAY, min=1, max=10),
+    wait=wait_exponential(multiplier=RETRY_DELAY, min=1, max=30),
 )
 async def fetch_manga_and_chapters(
     manga_id: str, semaphore: asyncio.Semaphore
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     try:
         async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-            # Fetch manga details with explicit headers
+            # Fetch manga details
             async with semaphore:
                 request_headers = HEADERS.copy()
                 try:
@@ -267,48 +267,110 @@ async def fetch_manga_and_chapters(
                         headers=request_headers,
                     ) as response:
                         if response.status != 200:
-                            raise Exception(
-                                f"Failed to fetch manga {manga_id}: {response.status}"
+                            print(
+                                f"Failed to fetch manga {manga_id}: Status {response.status}"
                             )
+                            raise Exception(f"HTTP {response.status}")
                         manga_data = await response.json()
+                        if not manga_data:
+                            raise Exception("Empty manga data response")
                         await asyncio.sleep(REQUEST_DELAY)
                 except asyncio.TimeoutError:
-                    print(f"Timeout while fetching manga {manga_id}, retrying...")
-                    raise  # This will trigger the retry decorator
+                    print(f"Timeout while fetching manga {manga_id}")
+                    raise
+                except Exception as e:
+                    print(f"Error fetching manga {manga_id}: {str(e)}")
+                    raise
 
             # Extract chapter IDs
-            chapter_ids = [chapter["id"] for chapter in manga_data["chapters"]]
+            chapter_ids = [chapter["id"] for chapter in manga_data.get("chapters", [])]
+            if not chapter_ids:
+                print(f"No chapters found for manga {manga_id}")
+                return manga_data, []
 
-            # Process chapters in batches with timeout handling
+            # Process chapters in smaller batches
             valid_chapters = []
-            for i in range(0, len(chapter_ids), CHAPTER_BATCH_SIZE):
-                batch = chapter_ids[i : i + CHAPTER_BATCH_SIZE]
+            batch_size = 10  # Reduce batch size
+            for i in range(0, len(chapter_ids), batch_size):
+                batch = chapter_ids[i : i + batch_size]
                 tasks = []
                 for chapter_id in batch:
-                    task = scrape_manga_chapter(
-                        manga_id, chapter_id, json.dumps(COOKIE_DATA)
+                    task = asyncio.create_task(
+                        scrape_manga_chapter(
+                            manga_id, chapter_id, json.dumps(COOKIE_DATA)
+                        )
                     )
                     tasks.append(task)
 
                 try:
                     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    valid_chapters.extend(
-                        [
-                            chapter
-                            for chapter in batch_results
-                            if not isinstance(chapter, Exception)
-                        ]
-                    )
-                except asyncio.TimeoutError:
-                    print(
-                        f"Timeout while fetching batch of chapters for manga {manga_id}, retrying..."
-                    )
-                    raise  # This will trigger the retry decorator
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            print(f"Chapter fetch error: {str(result)}")
+                            continue
+                        if result:
+                            valid_chapters.append(result)
+                    await asyncio.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    print(f"Batch processing error: {str(e)}")
+                    continue
+
+            if not valid_chapters:
+                print(f"No valid chapters fetched for manga {manga_id}")
 
             return manga_data, valid_chapters
     except Exception as e:
-        print(f"Error in fetch_manga_and_chapters for {manga_id}: {str(e)}")
+        print(f"Critical error in fetch_manga_and_chapters for {manga_id}: {str(e)}")
         raise
+
+
+async def process_single_manga(
+    manga: Dict[str, Any], pool: asyncpg.Pool, semaphore: asyncio.Semaphore
+) -> None:
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            manga_data, chapters = await fetch_manga_and_chapters(
+                manga["id"], semaphore
+            )
+            if not manga_data or not chapters:
+                print(
+                    f"Incomplete data for manga {manga['id']} on attempt {attempt + 1}"
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                return False
+
+            print(
+                f"Fetched manga: {manga_data['titles'].get('default', 'Unknown')} with {len(chapters)} chapters"
+            )
+
+            manga_chapters_metadata = {
+                chapter["id"]: {
+                    "views": chapter.get("views", "0"),
+                    "createdAt": chapter.get(
+                        "createdAt", datetime.now(timezone.utc).isoformat()
+                    ),
+                    "updatedAt": chapter.get(
+                        "updatedAt", datetime.now(timezone.utc).isoformat()
+                    ),
+                }
+                for chapter in manga_data.get("chapters", [])
+            }
+
+            await upsert_manga(pool, manga_data)
+            if chapters:
+                await upsert_chapters(pool, chapters, manga_chapters_metadata)
+            return True
+
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed for manga {manga['id']}: {str(e)}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                print(f"All attempts failed for manga {manga['id']}")
+                return False
 
 
 async def fetch_latest_manga_list(

@@ -1,281 +1,204 @@
 import asyncio
-import sys
-
-if sys.platform.startswith("win"):
-    import asyncio.windows_events
-
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-from uuid import uuid4
+import argparse
+import time
+from datetime import datetime, timezone
+import logging
 from sync import (
+    get_db_pool,
     fetch_latest_manga_list,
-    fetch_manga_and_chapters,
-    export_to_csv,
-    MAX_CONCURRENT_REQUESTS,
+    process_single_manga,
+    HEADERS,
+    URL,
 )
-import aiohttp
-from datetime import datetime
-from typing import Any, List, Dict, Set
-import csv
-import os
 
-# Add cache dictionary
-manga_cache = {}
-
-SYNC_INTERVAL = 300  # 5 minutes
-CONSECUTIVE_MATCHES_THRESHOLD = 3  # Stop after N manga with all chapters present
-BATCH_SIZE = 10  # Process multiple manga concurrently
-
-# Add constants to match sync.py
-COOKIE_VALUE = '{"user_version":"2.2","user_name":"Sn0w","user_image":"https:\/\/user.manganelo.com\/avt.png","user_data":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.lNXdfJGbnJyeiojIlBXe09lcnJCLiwWYj9Gbp9lclNXdfJGb2MzNxEjI6ICZfJGbnJCLigDNyV2c19lclNXdyEzdw42ciojI19lYsdmIsIyMc2VyX2FwaSI6IiJ9.KnKwLVkLwBR30v9OaHAHtXmaIcSqcrwekA5g-gnpW3Y"}'
-HEADERS = {"Cookie": f"user_acc={COOKIE_VALUE}"}
-CHAPTER_BATCH_SIZE = 15
-REQUEST_DELAY = 0
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("auto_sync.log"), logging.StreamHandler()],
+)
 
 
-def extract_temp_version(domain: str) -> str:
-    if "tempv" in domain:
-        return domain.split("tempv")[1].split(".")[0]
-    return ""
+async def get_last_update_time(pool):
+    """Get the most recent update time from the database"""
+    async with pool.acquire() as conn:
+        query = """
+        SELECT MAX(updated_at)
+        FROM (
+            SELECT updated_at FROM manga
+            UNION ALL
+            SELECT updated_at FROM chapter
+        ) as updates;
+        """
+        return await conn.fetchval(query)
 
 
-def parse_image_url(url: str) -> Dict[str, Any]:
-    parts = url.split("/")
-    domain = parts[2]
-    temp_ver = extract_temp_version(domain)
-    subdomain = domain.split(".")[0]
-    tab = parts[4].replace("tab_", "")
-    path = "/".join(parts[5:-2])
-    chapter = parts[-2].replace("chapter_", "")
-    filename = parts[-1]
-    img_parts = filename.split("-")
-    num = img_parts[0]
-    if len(img_parts) == 3:
-        version = img_parts[1]
-        quality, ext = img_parts[2].split(".")
-    else:
-        version = ""
-        quality, ext = img_parts[1].split(".")
-    return {
-        "s": subdomain,
-        "t": tab,
-        "tv": temp_ver,
-        "p": path,
-        "c": chapter,
-        "v": version,
-        "q": quality,
-        "e": ext,
-        "n": num,
-    }
-
-
-def optimize_image_urls(images: List[str]) -> Dict[str, Any]:
-    if not images:
-        return {}
-    first_url = images[0]
-    base_data = parse_image_url(first_url)
-    ext_groups = {}
-    for url in images:
-        img_data = parse_image_url(url)
-        num = int(img_data["n"])
-        ext = img_data["e"]
-        if ext not in ext_groups:
-            ext_groups[ext] = []
-        ext_groups[ext].append(num)
-    ranges = []
-    for ext, numbers in ext_groups.items():
-        numbers.sort()
-        current_range = {"start": numbers[0], "end": numbers[0]}
-        for num in numbers[1:]:
-            if num == current_range["end"] + 1:
-                current_range["end"] = num
-            else:
-                ranges.append(
-                    {"r": f"{current_range['start']}-{current_range['end']}", "e": ext}
-                )
-                current_range = {"start": num, "end": num}
-        ranges.append(
-            {"r": f"{current_range['start']}-{current_range['end']}", "e": ext}
-        )
-    return {
-        "s": base_data["s"],
-        "t": base_data["t"],
-        "tv": base_data["tv"],
-        "p": base_data["p"],
-        "c": base_data["c"],
-        "v": base_data["v"],
-        "q": base_data["q"],
-        "r": ranges,
-    }
-
-
-# Add new helper functions for CSV operations
-class CSVCache:
-    def __init__(self):
-        self.manga_dict = {}
-        self.chapters_dict = {}
-        self.is_loaded = False
-
-    def load_data(self):
-        if self.is_loaded:
-            return
-
-        if os.path.exists("exports/manga.csv"):
-            with open("exports/manga.csv", "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                self.manga_dict = {row["id"]: row for row in reader}
-
-        if os.path.exists("exports/chapters.csv"):
-            with open("exports/chapters.csv", "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    parent_id = row["parent_id"]
-                    if parent_id not in self.chapters_dict:
-                        self.chapters_dict[parent_id] = []
-                    self.chapters_dict[parent_id].append(row)
-
-        self.is_loaded = True
-
-
-# Create global cache instance
-csv_cache = CSVCache()
-
-
-# Replace existing CSV loading functions with cached versions
-async def get_manga_chapter_count(manga_id: str) -> int:
-    """Get chapter count for a specific manga from CSV cache"""
-    return len(csv_cache.chapters_dict.get(manga_id, []))
-
-
-async def get_manga_chapters(manga_id: str) -> Set[str]:
-    """Get existing chapter IDs for a specific manga from CSV cache"""
-    return {str(chapter["id"]) for chapter in csv_cache.chapters_dict.get(manga_id, [])}
-
-
-async def manga_exists(manga_id: str) -> bool:
-    """Check if manga exists in CSV cache"""
-    return manga_id in csv_cache.manga_dict
-
-
-async def fetch_manga_and_chapters_cached(manga_id: str, semaphore: asyncio.Semaphore):
-    cache_key = str(manga_id)
-    if cache_key not in manga_cache:
-        manga_cache[cache_key] = await fetch_manga_and_chapters(manga_id, semaphore)
-    return manga_cache[cache_key]
-
-
-async def process_manga_batch(
-    manga_batch: List[dict],
-    semaphore: asyncio.Semaphore,
-) -> List[bool]:
-    tasks = [update_manga_and_chapters(manga, semaphore) for manga in manga_batch]
-    return await asyncio.gather(*tasks, return_exceptions=True)
-
-
-# Modified update function to write to CSV
-async def update_manga_and_chapters(
-    manga: dict,
-    semaphore: asyncio.Semaphore,
-) -> bool:
+async def get_manga_update_time(manga_data):
+    """Get the most recent update time from manga data"""
     try:
-        manga_data, chapters = await fetch_manga_and_chapters_cached(
-            manga["id"], semaphore
-        )
-
-        # Get existing chapter IDs for this manga
-        existing_chapters = await get_manga_chapters(manga["id"])
-
-        # Filter new chapters
-        new_chapters = [
-            {**ch, "parent_id": ch["parentId"]}
-            for ch in chapters
-            if str(ch.get("id", "")) not in existing_chapters
-        ]
-
-        if new_chapters:
-            print(f"Adding {len(new_chapters)} new chapters for manga {manga['id']}")
-            export_to_csv(manga_data, new_chapters, False)
-
-        return True
-
-    except Exception as e:
-        print(f"Error processing manga {manga['id']}: {str(e)}")
-        return False
+        updated_at = manga_data.get("updatedAt")
+        if updated_at:
+            return datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        return None
+    except Exception:
+        return None
 
 
-async def update_data():
-    # Load CSV data once at the start
-    csv_cache.load_data()
-    manga_cache.clear()
-    consecutive_matches = 0
-    manga_batch = []
-
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    async with aiohttp.ClientSession() as session:
-        page = 1
-        while True:
-            try:
-                manga_list = await fetch_latest_manga_list(session, page)
-                if not manga_list or not manga_list.get("mangaList"):
-                    break
-
-                for manga in manga_list["mangaList"]:
-                    manga_id = manga["id"]
-                    exists = await manga_exists(manga_id)
-
-                    if exists:
-                        manga_data, _ = await fetch_manga_and_chapters_cached(
-                            manga_id, semaphore
-                        )
-                        api_chapter_count = len(manga_data["chapters"])
-                        db_chapter_count = await get_manga_chapter_count(manga_id)
-
-                        if api_chapter_count == db_chapter_count:
-                            consecutive_matches += 1
-                            if consecutive_matches >= CONSECUTIVE_MATCHES_THRESHOLD:
-                                if manga_batch:
-                                    await process_manga_batch(manga_batch, semaphore)
-                                return
-                            continue
-
-                    consecutive_matches = 0
-                    manga_batch.append(manga)
-
-                    if len(manga_batch) >= BATCH_SIZE:
-                        await process_manga_batch(manga_batch, semaphore)
-                        manga_batch = []
-
-                page += 1
-
-            except Exception as e:
-                print(f"Error during update: {str(e)}")
-                break
-
-        if manga_batch:
-            await process_manga_batch(manga_batch, semaphore)
-
-
-# Remove or comment out these unused database functions
-# async def update_database_manga(manga_data: Dict) -> None:
-# async def update_database_chapters(chapters: List[Dict], parent_id: str) -> None:
-
-
-async def continuous_update():
+async def auto_sync(interval_minutes: int = 30, min_pages: int = 3):
+    """
+    Continuously monitor and sync the database with dynamic page fetching
+    :param interval_minutes: Minutes to wait between sync operations
+    :param min_pages: Minimum number of pages to check in each sync operation
+    """
     while True:
-        print(f"\n=== Update started at {datetime.now()} ===")
         try:
-            await update_data()
+            start_time = time.time()
+            logging.info(f"Starting sync operation at {datetime.now()}")
+
+            # Create a new connection pool for this sync operation
+            pool = await get_db_pool()
+            semaphore = asyncio.Semaphore(5)  # Limit concurrent requests
+
+            # Get last update time from database
+            last_update = await get_last_update_time(pool)
+            if last_update is None:
+                last_update = datetime.min.replace(tzinfo=timezone.utc)
+            logging.info(f"Last database update: {last_update}")
+
+            async with aiohttp.ClientSession() as session:
+                page = 1
+                consecutive_no_updates = 0
+                total_updates = 0
+
+                while True:
+                    logging.info(f"Checking page {page}")
+
+                    try:
+                        manga_list = await fetch_latest_manga_list(session, page)
+                        if not manga_list:
+                            logging.warning(f"No manga found on page {page}")
+                            break
+
+                        manga_items = manga_list.get("mangaList", [])
+                        if not manga_items:
+                            break
+
+                        # Check if any manga in this page is newer than our last update
+                        page_has_updates = False
+                        tasks = []
+
+                        for manga in manga_items:
+                            manga_update_time = await get_manga_update_time(manga)
+                            if manga_update_time and manga_update_time > last_update:
+                                page_has_updates = True
+                                tasks.append(
+                                    process_single_manga(manga, pool, semaphore)
+                                )
+                            elif manga_update_time:
+                                logging.debug(
+                                    f"Skipping manga {manga.get('id')}: no new updates"
+                                )
+
+                        if tasks:
+                            results = await asyncio.gather(
+                                *tasks, return_exceptions=True
+                            )
+                            successes = sum(1 for r in results if r is True)
+                            failures = sum(1 for r in results if r is False)
+                            total_updates += successes
+                            logging.info(
+                                f"Page {page} results: {successes} succeeded, {failures} failed"
+                            )
+
+                        # Update consecutive no updates counter
+                        if page_has_updates:
+                            consecutive_no_updates = 0
+                        else:
+                            consecutive_no_updates += 1
+
+                        # Break conditions:
+                        # 1. We've processed minimum pages AND found no updates in last 2 pages
+                        # 2. We've processed 1 consecutive pages with no updates
+                        # 3. We've reached page 100 (safety limit)
+                        if (
+                            (page >= min_pages and consecutive_no_updates >= 2)
+                            or consecutive_no_updates >= 1
+                            or page >= 100
+                        ):
+                            logging.info(
+                                f"Stopping page fetch: reached stop condition at page {page}"
+                            )
+                            break
+
+                        await asyncio.sleep(1)  # Small delay between pages
+                        page += 1
+
+                    except Exception as e:
+                        logging.error(f"Error processing page {page}: {str(e)}")
+                        break
+
+            # Get updated statistics
+            async with pool.acquire() as conn:
+                manga_count = await conn.fetchval("SELECT COUNT(*) FROM Manga")
+                chapter_count = await conn.fetchval("SELECT COUNT(*) FROM Chapter")
+
+            # Close the pool
+            await pool.close()
+
+            # Log statistics
+            elapsed_time = time.time() - start_time
+            logging.info(f"Sync completed in {elapsed_time:.2f} seconds")
+            logging.info(f"Pages processed: {page}")
+            logging.info(f"Total updates: {total_updates}")
+            logging.info(
+                f"Database status: {manga_count} manga, {chapter_count} chapters"
+            )
+
+            # Calculate next sync time
+            next_sync = datetime.now() + timedelta(minutes=interval_minutes)
+            logging.info(f"Next sync scheduled for: {next_sync}")
+
+            # Wait for the next interval
+            await asyncio.sleep(interval_minutes * 60)
+
         except Exception as e:
-            print(f"Update failed: {str(e)}")
-        print(f"=== Update completed at {datetime.now()} ===")
-        print(f"Waiting {SYNC_INTERVAL} seconds before next update...")
-        await asyncio.sleep(SYNC_INTERVAL)
+            logging.error(f"Critical error in sync operation: {str(e)}")
+            logging.info("Waiting 5 minutes before retry...")
+            await asyncio.sleep(300)
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Automatic manga database synchronization"
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Sync interval in minutes (default: 5)",
+    )
+    parser.add_argument(
+        "--pages",
+        type=int,
+        default=1,
+        help="Number of pages to check per sync (default: 1)",
+    )
+    args = parser.parse_args()
+
+    logging.info(f"Starting auto-sync service with {args.interval} minute interval")
+    logging.info(f"Checking {args.pages} pages per sync")
+
+    try:
+        await auto_sync(args.interval, args.pages)
+    except KeyboardInterrupt:
+        logging.info("Auto-sync service stopped by user")
+    except Exception as e:
+        logging.error(f"Auto-sync service crashed: {str(e)}")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(continuous_update())
-    except KeyboardInterrupt:
-        print("\nUpdate process interrupted by user")
-    except Exception as e:
-        print(f"Fatal error: {str(e)}")
+    # Additional imports needed for the script to run
+    import aiohttp
+    from datetime import timedelta
+
+    asyncio.run(main())
