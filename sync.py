@@ -16,8 +16,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from scrape import scrape_manga_chapter
 
 MAX_CONCURRENT_REQUESTS = 5
-CHAPTER_BATCH_SIZE = 20
-REQUEST_DELAY = 0.5
+CHAPTER_BATCH_SIZE = 50
+REQUEST_DELAY = 0
 MAX_RETRIES = 5
 RETRY_DELAY = 2
 
@@ -306,15 +306,17 @@ def export_to_csv(
         "next_chapter",
         "previous_chapter",
         "parent_id",
+        "views",
+        "pages",
         "created_at",
         "updated_at",
-        "pages",
     ]
 
     # Fix: Properly handle chapter data
     new_chapters_data = []
     manga_chapters_metadata = {
         chapter["id"]: {
+            "views": chapter["views"],
             "createdAt": chapter["createdAt"],
             "updatedAt": chapter["updatedAt"],
         }
@@ -340,9 +342,10 @@ def export_to_csv(
                 "next_chapter": chapter.get("nextChapter", ""),
                 "previous_chapter": chapter.get("previousChapter", ""),
                 "parent_id": chapter.get("parentId", ""),
+                "views": chapter_metadata.get("views", 0),
+                "pages": chapter.get("pages", 0),
                 "created_at": chapter_metadata.get("createdAt", timestamp),
                 "updated_at": chapter_metadata.get("updatedAt", timestamp),
-                "pages": chapter.get("pages", 0),
             }
             new_chapters_data.append(chapter_row)
         except Exception as e:
