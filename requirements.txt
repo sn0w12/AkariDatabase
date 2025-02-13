@@ -1,5 +1,8 @@
-aiohttp
-pandas
-supabase
-uuid
-python-dotenv
+aiohttp==3.11.11
+asyncpg==0.30.0
+beautifulsoup4==4.13.3
+pandas==2.2.3
+python-dotenv==1.0.1
+Requests==2.32.3
+tenacity==9.0.0
+tqdm==4.65.0
