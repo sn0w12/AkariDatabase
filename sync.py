@@ -32,7 +32,7 @@ COOKIE_DATA = {
     "user_data": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.lNXdfJGbnJyeiojIlBXe09lcnJCLiwWYj9Gbp9lclNXdfJGb2MzNxEjI6ICZfJGbnJCLigDNyV2c19lclNXdyEzdw42ciojI19lYsdmIsIyMc2VyX2FwaSI6IiJ9.KnKwLVkLwBR30v9OaHAHtXmaIcSqcrwekA5g-gnpW3Y",
 }
 HEADERS = {"Cookie": f"user_acc={json.dumps(COOKIE_DATA)}"}
-URL = "http://localhost:3000"
+URL = "https://akari-psi.vercel.app"
 
 TIMEOUT = ClientTimeout(total=60)  # Increase from 30 to 60 seconds
 
