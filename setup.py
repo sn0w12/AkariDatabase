@@ -68,45 +68,43 @@ async def setup_database():
         """)
 
         # Create search trigger function
-        await conn.execute("""
-            CREATE OR REPLACE FUNCTION manga_search_update_trigger() RETURNS trigger AS $$
-            begin
-                new.search_vector :=
-                    setweight(to_tsvector('pg_catalog.english', coalesce(new.titles->>'default', '')), 'A') ||
-                    setweight(to_tsvector('pg_catalog.english', coalesce(new.description, '')), 'B');
-                return new;
-            end
-            $$ LANGUAGE plpgsql;
-        """)
-
-        # Create trigger
-        await conn.execute("""
-            DROP TRIGGER IF EXISTS manga_search_vector_update ON Manga;
-            CREATE TRIGGER manga_search_vector_update
-            BEFORE INSERT OR UPDATE ON Manga
-            FOR EACH ROW
-            EXECUTE FUNCTION manga_search_update_trigger();
-        """)
+        # await conn.execute("""
+        #     CREATE OR REPLACE FUNCTION manga_search_update_trigger() RETURNS trigger AS $$
+        #     begin
+        #         new.search_vector :=
+        #             setweight(to_tsvector('pg_catalog.english', coalesce(new.titles->>'default', '')), 'A') ||
+        #             setweight(to_tsvector('pg_catalog.english', coalesce(new.description, '')), 'B');
+        #         return new;
+        #     end
+        #     $$ LANGUAGE plpgsql;
+        # """)
+        #
+        # # Create trigger
+        # await conn.execute("""
+        #     DROP TRIGGER IF EXISTS manga_search_vector_update ON Manga;
+        #     CREATE TRIGGER manga_search_vector_update
+        #     BEFORE INSERT OR UPDATE ON Manga
+        #     FOR EACH ROW
+        #     EXECUTE FUNCTION manga_search_update_trigger();
+        # """)
 
         # Create indexes
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_manga_created_at ON Manga(created_at DESC);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_manga_updated_at ON Manga(updated_at DESC);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_manga_views ON Manga(views);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chapter_parent_id ON Chapter(parent_id);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_manga_genres ON Manga USING GIN(genres);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_manga_search_vector ON Manga USING GIN(search_vector);"
-        )
+        # Create performance indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_manga_genres ON Manga USING GIN(genres);
+            CREATE INDEX IF NOT EXISTS idx_manga_manga_id_updated_at ON Manga(manga_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_manga_updated_at ON Manga(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_manga_views ON Manga(views DESC);
+            CREATE INDEX IF NOT EXISTS idx_chapter_id ON Chapter(id);
+            CREATE INDEX IF NOT EXISTS idx_chapter_parent_id_id ON Chapter(parent_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chapter_created_at ON Chapter(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_chapter_parent_id_created_at_pages ON Chapter(parent_id, created_at DESC, pages);
+            CREATE INDEX IF NOT EXISTS idx_manga_authors ON Manga USING GIN(authors);
+            CREATE INDEX IF NOT EXISTS idx_manga_authors_updated_at ON Manga(authors, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_manga_titles_gin ON Manga USING GIN((titles::text) gin_trgm_ops);
+            CREATE INDEX IF NOT EXISTS idx_manga_search_vector ON Manga USING GIN(search_vector);
+            CREATE INDEX IF NOT EXISTS idx_manga_updated_at ON Manga(updated_at DESC);
+        """)
 
         print("Database setup completed successfully!")
 
